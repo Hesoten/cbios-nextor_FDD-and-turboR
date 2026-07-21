@@ -1,0 +1,222 @@
+name: build-and-release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  N80_URL: https://github.com/Konamiman/Nestor80/releases/download/n80-v1.3.5/N80_1.3.5_SelfContained_linux-x64.zip
+  LK80_URL: https://github.com/Konamiman/Nestor80/releases/download/n80-v1.3.3-lk80-v1.1/LK80_1.1.0_SelfContained_linux-x64.zip
+  LB80_URL: https://github.com/Konamiman/Nestor80/releases/download/lb80-v1.0/LB80_1.0_SelfContained_linux-x64.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pasmo make zip curl unzip coreutils sdcc
+
+      - name: Fetch Nestor80 tool chain (N80 / LK80 / LB80)
+        run: |
+          mkdir -p tools
+          for url in "$N80_URL" "$LK80_URL" "$LB80_URL"; do
+            curl -fsSL "$url" -o /tmp/tool.zip
+            unzip -o /tmp/tool.zip -d tools/
+          done
+          chmod +x tools/N80 tools/LK80 tools/LB80
+          echo "$PWD/tools" >> "$GITHUB_PATH"
+
+      - name: Add mknexrom (bundled with Nextor) to PATH
+        run: |
+          chmod +x nextor/buildtools/linux/mknexrom
+          echo "$PWD/nextor/buildtools/linux" >> "$GITHUB_PATH"
+
+      - name: Build all required C-BIOS ROMs
+        run: |
+          make -C cbios \
+            derived/bin/cbios_main_msx2.rom \
+            derived/bin/cbios_main_msx2_br.rom \
+            derived/bin/cbios_main_msx2_eu.rom \
+            derived/bin/cbios_main_msx2_jp.rom \
+            derived/bin/cbios_main_msx2+.rom \
+            derived/bin/cbios_main_msx2+_br.rom \
+            derived/bin/cbios_main_msx2+_eu.rom \
+            derived/bin/cbios_main_msx2+_jp.rom \
+            derived/bin/cbios_main_msxtr_jp.rom \
+            derived/bin/cbios_sub.rom \
+            derived/bin/cbios_logo_msx2.rom \
+            derived/bin/cbios_logo_msx2+.rom \
+            derived/bin/cbios_music.rom
+
+      - name: Build Nextor kernel base
+        run: make -C nextor/source/kernel base
+
+      - name: Assemble Nextor + TC8566AF driver ROM
+        run: ./driver/build.sh
+
+      - name: Package blueMSX archive (18 machines)
+        run: |
+          ROOT="dist/blueMSX/Machines"
+          CBIOS="cbios/derived/bin"
+          NEXTOR="bin/nextor-tc8566af.rom"
+          LIC="LICENSES"
+
+          copy_machine() {
+            local name="$1"; local main="$2"; local logo="$3"
+            local include_music="$4"; local include_nextor="$5"
+            local dest="$ROOT/$name"
+            mkdir -p "$dest"
+            cp "$CBIOS/$main"     "$dest/"
+            cp "$CBIOS/$logo"     "$dest/"
+            cp "$CBIOS/cbios_sub.rom" "$dest/"
+            if [ "$include_music" = "yes" ]; then
+              cp "$CBIOS/cbios_music.rom" "$dest/"
+            fi
+            if [ "$include_nextor" = "yes" ]; then
+              cp "$NEXTOR" "$dest/"
+              cp "$LIC/LICENSE-Nextor.md"    "$dest/"
+              cp "$LIC/LICENSE-TC8566AF.txt" "$dest/"
+            fi
+            cp "configs/blueMSX/Machines/$name/config.ini" "$dest/"
+            cp "$LIC/cbios.txt"          "$dest/"
+          }
+
+          # MSX2 non-FDD variants (V9938, no music, slot 3.2 free for MFRSD etc.)
+          copy_machine "MSX2 - C-BIOS"          cbios_main_msx2.rom     cbios_logo_msx2.rom  no  no
+          copy_machine "MSX2 - C-BIOS - BR"     cbios_main_msx2_br.rom  cbios_logo_msx2.rom  no  no
+          copy_machine "MSX2 - C-BIOS - EU"     cbios_main_msx2_eu.rom  cbios_logo_msx2.rom  no  no
+          copy_machine "MSX2 - C-BIOS - JP"     cbios_main_msx2_jp.rom  cbios_logo_msx2.rom  no  no
+
+          # MSX2 FDD variants (V9938, no music, Nextor+TC8566AF in slot 3.3)
+          copy_machine "MSX2 - C-BIOS FDD"      cbios_main_msx2.rom     cbios_logo_msx2.rom  no  yes
+          copy_machine "MSX2 - C-BIOS FDD - BR" cbios_main_msx2_br.rom  cbios_logo_msx2.rom  no  yes
+          copy_machine "MSX2 - C-BIOS FDD - EU" cbios_main_msx2_eu.rom  cbios_logo_msx2.rom  no  yes
+          copy_machine "MSX2 - C-BIOS FDD - JP" cbios_main_msx2_jp.rom  cbios_logo_msx2.rom  no  yes
+
+          # MSX2+ non-FDD variants (V9958, with music, slot 3.2 free for MFRSD etc.)
+          copy_machine "MSX2+ - C-BIOS"          cbios_main_msx2+.rom     cbios_logo_msx2+.rom yes no
+          copy_machine "MSX2+ - C-BIOS - BR"     cbios_main_msx2+_br.rom  cbios_logo_msx2+.rom yes no
+          copy_machine "MSX2+ - C-BIOS - EU"     cbios_main_msx2+_eu.rom  cbios_logo_msx2+.rom yes no
+          copy_machine "MSX2+ - C-BIOS - JP"     cbios_main_msx2+_jp.rom  cbios_logo_msx2+.rom yes no
+
+          # MSX2+ FDD variants (V9958, with music, Nextor+TC8566AF in slot 3.3)
+          copy_machine "MSX2+ - C-BIOS FDD"      cbios_main_msx2+.rom     cbios_logo_msx2+.rom yes yes
+          copy_machine "MSX2+ - C-BIOS FDD - BR" cbios_main_msx2+_br.rom  cbios_logo_msx2+.rom yes yes
+          copy_machine "MSX2+ - C-BIOS FDD - EU" cbios_main_msx2+_eu.rom  cbios_logo_msx2+.rom yes yes
+          copy_machine "MSX2+ - C-BIOS FDD - JP" cbios_main_msx2+_jp.rom  cbios_logo_msx2+.rom yes yes
+
+          # turboR variants (V9958 + R800, with music)
+          copy_machine "MSXturboR - C-BIOS FDD"  cbios_main_msxtr_jp.rom cbios_logo_msx2+.rom yes yes
+          copy_machine "MSXturboR - C-BIOS"      cbios_main_msxtr_jp.rom cbios_logo_msx2+.rom yes no
+
+          # Shared KANJI.rom referenced by the JP and turboR configs
+          mkdir -p "$ROOT/Shared Roms"
+          cp "configs/blueMSX/Machines/Shared Roms/KANJI.rom" "$ROOT/Shared Roms/"
+          cp "$LIC/LICENSE-KANJI.txt" "$ROOT/Shared Roms/"
+
+          (cd dist/blueMSX && zip -r "../cbios-nextor-fdd-blueMSX.zip" Machines)
+
+      - name: Package openMSX archive (18 machines)
+        run: |
+          # openMSX resolves ROM filenames referenced by machine XMLs relative
+          # to the XML's own directory first; placing them in share/systemroms
+          # doesn't reliably work for custom (non-database) ROMs like our fork
+          # build. So we ship XMLs and their ROMs together in share/machines.
+          # KANJI.rom is the exception: its <rom> entries carry a fixed <sha1>,
+          # which the systemroms file pool resolves by content, so it ships in
+          # share/systemroms (the conventional place for system ROMs).
+          MACHINES="dist/openMSX/share/machines"
+          SYSROMS="dist/openMSX/share/systemroms"
+          CBIOS="cbios/derived/bin"
+          NEXTOR="bin/nextor-tc8566af.rom"
+          LIC="LICENSES"
+
+          mkdir -p "$MACHINES"
+
+          # Copy all machine XMLs
+          cp configs/openMSX/machines/*.xml "$MACHINES/"
+
+          # Copy all built ROMs next to the XMLs
+          cp "$CBIOS/cbios_main_msx2.rom"     "$MACHINES/"
+          cp "$CBIOS/cbios_main_msx2_br.rom"  "$MACHINES/"
+          cp "$CBIOS/cbios_main_msx2_eu.rom"  "$MACHINES/"
+          cp "$CBIOS/cbios_main_msx2_jp.rom"  "$MACHINES/"
+          cp "$CBIOS/cbios_main_msx2+.rom"    "$MACHINES/"
+          cp "$CBIOS/cbios_main_msx2+_br.rom" "$MACHINES/"
+          cp "$CBIOS/cbios_main_msx2+_eu.rom" "$MACHINES/"
+          cp "$CBIOS/cbios_main_msx2+_jp.rom" "$MACHINES/"
+          cp "$CBIOS/cbios_main_msxtr_jp.rom" "$MACHINES/"
+          cp "$CBIOS/cbios_sub.rom"           "$MACHINES/"
+          cp "$CBIOS/cbios_logo_msx2.rom"     "$MACHINES/"
+          cp "$CBIOS/cbios_logo_msx2+.rom"    "$MACHINES/"
+          cp "$CBIOS/cbios_music.rom"         "$MACHINES/"
+          cp "$NEXTOR"                        "$MACHINES/"
+
+          # KANJI.rom goes into the ROM pool; the JP/turboR XMLs carry its SHA1
+          mkdir -p "$SYSROMS"
+          cp "configs/blueMSX/Machines/Shared Roms/KANJI.rom" "$SYSROMS/"
+
+          # For each shipped ROM, compute SHA1 and replace the upstream-style
+          # <!--sha1:FILENAME--> placeholder in the packaged XMLs with a real
+          # <sha1>...</sha1> element. KANJI.rom needs no placeholder: it is a
+          # fixed binary, so its <sha1> is written directly in the source XMLs.
+          python3 - <<'PY'
+          import glob, hashlib, os, re
+          machines = "dist/openMSX/share/machines"
+          shas = {}
+          for rom in sorted(glob.glob(f"{machines}/*.rom")):
+              name = os.path.basename(rom)
+              with open(rom, "rb") as f:
+                  shas[name] = hashlib.sha1(f.read()).hexdigest()
+          for xml in sorted(glob.glob(f"{machines}/*.xml")):
+              with open(xml, encoding="utf-8") as f:
+                  content = f.read()
+              for name, sha in shas.items():
+                  pat = re.compile(r"<!--sha1:" + re.escape(name) + r"-->")
+                  content = pat.sub(f"<sha1>{sha}</sha1>", content)
+              with open(xml, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print(f"  updated {os.path.basename(xml)}")
+          PY
+
+          # Ship license files at the top of the archive
+          cp "$LIC/cbios.txt"             "dist/openMSX/"
+          cp "$LIC/LICENSE-Nextor.md"     "dist/openMSX/"
+          cp "$LIC/LICENSE-KANJI.txt"     "dist/openMSX/"
+          cp "$LIC/LICENSE-TC8566AF.txt"  "dist/openMSX/"
+
+          (cd dist/openMSX && zip -r "../cbios-nextor-fdd-openMSX.zip" share cbios.txt LICENSE-Nextor.md LICENSE-KANJI.txt LICENSE-TC8566AF.txt)
+
+      - name: Upload blueMSX build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cbios-nextor-fdd-blueMSX
+          path: dist/cbios-nextor-fdd-blueMSX.zip
+          retention-days: 7
+
+      - name: Upload openMSX build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cbios-nextor-fdd-openMSX
+          path: dist/cbios-nextor-fdd-openMSX.zip
+          retention-days: 7
+
+      - name: Attach archives to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cbios-nextor-fdd-blueMSX.zip
+            dist/cbios-nextor-fdd-openMSX.zip
