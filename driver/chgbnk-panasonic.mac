@@ -1,0 +1,42 @@
+	.z80
+	title	CHGBNK - Bank Switching Module (Panasonic 7FF0h flavor)
+;
+;-----------------------------------------------------------------------
+;
+;   Bank switching for the mknexrom-produced ROM, writing the bank
+;   selector to 7FF0h (Panasonic-style register address).  Derived from
+;   the upstream StandaloneASCII16/chgbnk.mac; only BNKREG differs.
+;
+;   Rationale: blueMSX romMapperTC8566AF accepts writes to 6000h,
+;   7FF0h and 7FFEh interchangeably, so an ASCII16-style CHGBNK works
+;   there.  openMSX's TurboRFDC device (which is what <TC8566AF> in
+;   the machine XML instantiates) only listens for the bank selector
+;   at 7FF0h, so we build with the Panasonic address for portability.
+;
+;   Layout, prologue and defs padding kept byte-for-byte identical to
+;   the ASCII16 flavor, so mknexrom's placement of this routine at the
+;   tail of every kernel bank is unaffected.
+;
+; Entry:  Acc = 0..N  --- select bank Acc
+; Exit:   none
+; Only AF is modified.
+;
+
+BNKREG	equ	7FF0h		;Panasonic bank register (openMSX-compatible)
+BNKID	equ	40FFh		;Where Bank ID is stored
+
+;Bank change for Sunrise ID, it is quite weird:
+;bank bit 0 -> register bit 7
+;bank bit 1 -> register bit 6
+;bank bit 2 -> register bit 5
+
+	org 7FD0h
+
+CHGBNK:
+
+	ld	(BNKREG),a
+	ret
+;
+	defs	(8000h-7FD0h)-($-CHGBNK),0FFh
+;
+	end

@@ -1,0 +1,8 @@
+[submodule "cbios"]
+	path = cbios
+	url = https://github.com/Hesoten/cbios.git
+	branch = feature/nextor-turbor
+[submodule "nextor"]
+	path = nextor
+	url = https://github.com/Hesoten/Nextor.git
+	branch = feature/cbios-tc8566af

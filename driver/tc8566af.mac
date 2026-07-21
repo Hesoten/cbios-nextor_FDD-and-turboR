@@ -1,0 +1,811 @@
+;-----------------------------------------------------------------------------
+; Copyright (c) 2026 Hesoten
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met:
+;
+; 1. Redistributions of source code must retain the above copyright notice,
+;    this list of conditions and the following disclaimer.
+;
+; 2. Redistributions in binary form must reproduce the above copyright notice,
+;    this list of conditions and the following disclaimer in the documentation
+;    and/or other materials provided with the distribution.
+;
+; 3. Neither the name of the copyright holder nor the names of its
+;    contributors may be used to endorse or promote products derived from this
+;    software without specific prior written permission.
+;
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;-----------------------------------------------------------------------------
+
+	.z80
+	title	Nextor drive-based driver for TC8566AF FDC
+	subttl	Two logical drives (A:/B:) mapped onto one physical drive
+
+;-----------------------------------------------------------------------------
+; Nextor drive-based driver for the TC8566AF FDC (Panasonic FS-A1 series /
+; MSX turboR internal FDC; blueMSX ROM_TC8566AF_TR mapping).
+;
+; Register map (ROM_TC8566AF_TR, overlaid on page 1 in every bank):
+;   7FF0h R   bank readback
+;   7FF1h R   disk change: bit4=0 -> drive 0 changed, bit5=0 -> drive 1 changed
+;             (destructive read: reading clears the underlying flag)
+;   7FF2h W   FDC control register 0 (drive select, motor)
+;   7FF3h W   FDC control register 1
+;   7FF4h R   FDC main status register (RQM/DIO/NDM)
+;   7FF5h R/W FDC data register (command/execution/result phases)
+;-----------------------------------------------------------------------------
+
+	INCLUDE	macros.inc
+	INCLUDE	const.inc
+
+	; Routines available on kernel page 0
+
+GSLOT1	equ	402Dh	;Get page-1 slot (via CALBNK to bank 0)
+RDBANK	equ	403Ch	;Read byte from another bank (via CALBNK)
+CALLB0	equ	403Fh	;Call routine in kernel bank 0 (address in CODE_ADD)
+CALBNK	equ	4042h	;Call routine in another bank
+GWORK	equ	4045h	;Get SLTWRK entry (via CALBNK to bank 0)
+
+	; Data locations on kernel banks 0 and 3 (Nextor 2.1.x)
+
+PROMPT	equ	41E8h	;"Insert disk for drive X:" prompt, kernel bank 0
+CODE_ADD equ	0F1D0h	;Routine address parameter for CALLB0
+null_message	equ	741Fh	;Null format-choice string ("no format")
+single_double	equ	7420h	;"Single side/double side" choice string
+
+	; TC8566AF registers (ROM_TC8566AF_TR mapping)
+
+FDC_BANK	equ	7FF0h	;R: current bank
+FDC_DSKCHG	equ	7FF1h	;R: disk change bits (destructive)
+FDC_CTRL0	equ	7FF2h	;W: drive select / motor
+FDC_CTRL1	equ	7FF3h	;W: control 1
+FDC_MSR		equ	7FF4h	;R: main status register
+FDC_DATA	equ	7FF5h	;R/W: data register
+
+	; Driver error codes (drive-based convention)
+
+ERR_WPROT	equ	0	;Write protected
+ERR_NRDY	equ	2	;Not ready
+ERR_CRC		equ	4	;Data (CRC) error
+ERR_SEEK	equ	6	;Seek error
+ERR_RNF		equ	8	;Record not found
+ERR_WFAULT	equ	10	;Write fault
+ERR_OTHER	equ	12	;Other error
+
+	; Rules for disk driver code:
+	;- Compiled at 4100h; 256-byte dummy page prepended before MKNEXROM.
+	;- Kernel page 0 occupies 4000h-40FEh in every bank; bank ID at 40FFh.
+	;- Bank switching code lives at 7FD0h in every bank.
+	;- 7FF0h-7FFFh is shadowed by the FDC register overlay: no code or
+	;  data may be placed there (CHGBNK at 7FD0h-7FD4h is safe).
+
+	;***********************************
+	;***  DRIVER HEADER (4100h)      ***
+	;***********************************
+
+	org	4100h
+
+	db	"NEXTOR_DRIVER",0	;Mandatory signature (4100h)
+	db	0	;410Eh: flags, bit0=0 -> drive-based
+	db	0	;410Fh: reserved
+	db	"TC8566AF FDC drive-based driver "	;4110h: name, 32 chars
+
+	;* Timer interrupt routine (4130h)
+	;  Not used: games replace the interrupt handler, killing the H.TIMI
+	;  chain, so the motor is switched off at the end of each operation
+	;  instead (MTOFF; matches observed real FS-A1GT lamp behaviour).
+
+	ret	;TIMER_INT
+	ret
+	ret
+
+	;* Get driver version (4133h)
+
+	jp	DV_VERSION
+
+	;* Driver initialization (4136h), called twice (A=0 / A=1)
+
+	jp	DV_INIT
+
+	;* BASIC expanded statement handler (4139h)
+
+	scf	;STATEMENT
+	ret
+	ret
+
+	;* BASIC expanded device handler (413Ch)
+
+	scf	;BASDEV
+	ret
+	ret
+
+	;* Extended BIOS hook (413Fh)
+
+	ret	;EXTBIO
+	ret
+	ret
+
+	;* Direct calls entry points (4142h-414Eh)
+
+	ret	;DIRECT0
+	ret
+	ret
+	ret	;DIRECT1
+	ret
+	ret
+	ret	;DIRECT2
+	ret
+	ret
+	ret	;DIRECT3
+	ret
+	ret
+	ret	;DIRECT4
+	ret
+	ret
+
+	ds	15	;Reserved (4151h-415Fh)
+
+	;* Drive-based disk routines jump table (4160h)
+
+	jp	DSKIO		;4160h: sector read/write
+	jp	DSKCHG		;4163h: disk change detection
+	jp	GETDPB		;4166h: get disk parameter block
+	jp	CHOICE		;4169h: get format choice string
+	jp	DSKFMT		;416Ch: format a disk
+	jp	MTOFF		;416Fh: turn motor off
+
+	;***********************************
+	;***  DRIVER ROUTINES            ***
+	;***********************************
+
+;------------------------------------------------------------------------------
+; DSKIO - Read/write sectors.
+;   In : A=unit (0/1), Cy=0 read / 1 write, B=sector count,
+;        C=media descriptor (bit7=1) or sector bits 22-16, DE=sector (LBA),
+;        HL=transfer address (never in page 1, kernel guarantees)
+;   Out: Cy=0 on success. Cy=1, A=error, B=sectors actually transferred.
+;------------------------------------------------------------------------------
+
+DSKIO:
+	jp	c,dio_write
+
+	call	dio_pre		;Select drive, check media
+	ret	c		;Not ready (B=0, A=ERR_NRDY)
+	ret	z		;Zero sectors: nothing to do (Cy=0)
+dio_rloop:
+	call	READ1		;One sector: DE=LBA, HL=dest (+512 on return)
+	jr	c,dio_err
+	inc	de
+	djnz	dio_rloop
+dio_ok:
+	call	MTOFF		;Motor off at end of operation
+	xor	a
+	ret
+
+dio_write:
+	call	dio_pre
+	ret	c
+	ret	z
+dio_wloop:
+	call	WRITE1		;One sector: DE=LBA, HL=source (+512 on return)
+	jr	c,dio_err
+	inc	de
+	djnz	dio_wloop
+	jr	dio_ok
+
+dio_err:
+	ld	c,a		;Error code
+	exx
+	ld	a,b		;Original count
+	exx
+	sub	b		;- remaining
+	ld	b,a		;= sectors transferred
+	ld	a,c
+	call	MTOFF		;Motor off at end of operation (preserves AF)
+	scf
+	ret
+
+; Common DSKIO prologue. In: A=unit, B=sector count.
+; Out: Cy=1 -> not ready (A=ERR_NRDY, B=0).
+;      Cy=0, Z  -> zero sectors, nothing to do.
+;      Cy=0, NZ -> proceed; C'=unit, B'=original count.
+
+dio_pre:
+	call	MAP_UNIT	;Logical unit -> physical drive (may prompt)
+	exx
+	ld	c,a		;C' = unit for the whole transfer
+	exx
+	push	bc
+	push	de
+	push	hl
+	call	FDC_SEL		;Drive select + motor on
+	call	CHK_READY	;SENSE DEVICE STATUS: media present?
+	pop	hl
+	pop	de
+	pop	bc
+	jr	nc,dp_rdy
+	call	MTOFF		;Motor off, not ready (preserves AF)
+	ld	b,0
+	ret			;Cy=1, A=ERR_NRDY
+dp_rdy:
+	ld	a,b
+	or	a		;Z (Cy=0) if zero sectors
+	call	z,MTOFF		;(motor off; MTOFF preserves AF)
+	ret	z
+	exx
+	ld	b,a		;B' = original count (for error reporting)
+	exx
+	ret			;NZ, NC
+
+;------------------------------------------------------------------------------
+; READ1 / WRITE1 - Transfer one sector via the FDC.
+;   In : C'=unit, DE=LBA, HL=buffer, B preserved
+;   Out: Cy=0 + HL advanced by 512, or Cy=1 + A=error code
+;------------------------------------------------------------------------------
+
+READ1:
+	push	bc
+	push	de
+	push	hl		;buffer
+	call	RW_SETUP	;SEEK etc.; B=cyl, D=unit/head, E=sector
+	jr	c,rw_err0
+	ld	a,46h		;READ DATA, MT=0 MFM=1 SK=0
+	call	RW_CMD		;(MFM bit mandatory: blueMSX checks &0C0h=40h)
+	jr	c,rw_err0
+
+	;--- Execution phase: 512 bytes in, polling RQM per byte
+	;    (RQM drops after each data byte and returns after ~60us)
+	;TODO real HW: timeout + early result-phase detection (NDM drop)
+
+	pop	hl		;buffer
+	ld	bc,512
+r1_xf:	ld	a,(FDC_MSR)
+	rlca			;RQM -> Cy
+	jr	nc,r1_xf
+	ld	a,(FDC_DATA)
+	ld	(hl),a
+	inc	hl
+	dec	bc
+	ld	a,b
+	or	c
+	jr	nz,r1_xf
+	jr	RW_RESULT
+
+WRITE1:
+	push	bc
+	push	de
+	push	hl		;source
+	call	RW_SETUP
+	jr	c,rw_err0
+	ld	a,45h		;WRITE DATA, MT=0 MFM=1
+	call	RW_CMD
+	jr	c,rw_err0
+
+	;--- Execution phase: 512 bytes out, polling RQM per byte
+
+	pop	hl		;source
+	ld	bc,512
+w1_xf:	ld	a,(FDC_MSR)
+	rlca			;RQM -> Cy
+	jr	nc,w1_xf
+	ld	a,(hl)
+	ld	(FDC_DATA),a
+	inc	hl
+	dec	bc
+	ld	a,b
+	or	c
+	jr	nz,w1_xf
+	;fall through to RW_RESULT
+
+	;--- Result phase: ST0 ST1 ST2 C H R N (shared by read and write)
+
+RW_RESULT:
+	call	FDC_GET		;ST0
+	jr	c,rw_err1
+	ld	d,a
+	call	FDC_GET		;ST1
+	jr	c,rw_err1
+	ld	e,a
+	call	FDC_GET		;ST2
+	call	FDC_GET		;C
+	call	FDC_GET		;H
+	call	FDC_GET		;R
+	call	FDC_GET		;N
+
+	ld	a,e
+	and	02h		;ST1 NW first: blueMSX reports a write-protect
+	jr	nz,rw_wp	; failure with NW only (IC stays 00)
+	ld	a,d
+	and	0C0h		;IC bits: 00 = normal termination
+	jr	nz,rw_bad
+	pop	de
+	pop	bc
+	xor	a
+	ret			;OK; HL = buffer+512
+
+rw_wp:	ld	a,ERR_WPROT
+	jr	rw_set
+rw_bad:	ld	a,ERR_CRC
+	bit	5,e		;ST1 DE: data error
+	jr	nz,rw_set
+	ld	a,ERR_RNF
+	bit	2,e		;ST1 ND: no data
+	jr	nz,rw_set
+	ld	a,ERR_OTHER
+rw_set:	scf
+rw_err1:
+	pop	de
+	pop	bc
+	ret			;Cy=1, A=error
+
+rw_err0:
+	pop	hl		;discard buffer
+	pop	de
+	pop	bc
+	ret			;Cy=1, A=error (from FDC_PUT/FDC_GET)
+
+; RW_SETUP: compute CHS and SEEK to the target track (the emulated FDC
+; transfers at its currentTrack, not the C parameter of READ/WRITE DATA).
+;   In : C'=unit, DE=LBA
+;   Out: Cy=0, B=cylinder, D=unit/head byte ((HD<<2)|US), E=sector (R)
+;        Cy=1 on FDC timeout
+
+RW_SETUP:
+	call	LBA2CHS		;-> B=track, C=sector (1-based), A=side
+	add	a,a
+	add	a,a
+	ld	d,a		;D = side<<2
+	exx
+	ld	a,c		;unit
+	exx
+	or	d
+	ld	d,a		;D = unit/head byte
+	ld	e,c		;E = sector number (R)
+
+	ld	a,0Fh		;SEEK
+	call	FDC_PUT
+	ret	c
+	ld	a,d
+	call	FDC_PUT
+	ret	c
+	ld	a,b		;NCN = target track
+	call	FDC_PUT
+	ret	c
+
+	; Wait for drive busy bit to clear in MSR (bits [3:0]).
+	; openMSX emulates ~1ms/track seek delay; without this poll the
+	; subsequent READ starts while heads are still moving and the FDC
+	; returns "abnormal termination / missing address mark".  blueMSX
+	; completes SEEK synchronously so this poll degrades to a no-op.
+	push	bc
+	ld	bc,0		;65536-poll timeout guard
+sk_wait:
+	ld	a,(FDC_MSR)
+	and	0Fh		;D3B..D0B (drive busy bits)
+	jr	z,sk_done
+	dec	bc
+	ld	a,b
+	or	c
+	jr	nz,sk_wait
+	pop	bc
+	ld	a,ERR_NRDY
+	scf
+	ret
+sk_done:
+	pop	bc
+
+	ld	a,08h		;SENSE INTERRUPT STATUS (mandatory after SEEK
+	call	FDC_PUT		; per Fujitsu datasheet; returns ST0 + PCN)
+	ret	c
+	call	FDC_GET		;ST0 (discard)
+	ret	c
+	jp	FDC_GET		;PCN (discard); Cy from FDC_GET
+
+; RW_CMD: send a READ/WRITE DATA command with its 8 parameter bytes.
+;   In : A=command byte, B=cylinder, D=unit/head, E=sector
+;   Out: Cy=1 on FDC timeout
+
+RW_CMD:
+	call	FDC_PUT		;command
+	ret	c
+	ld	a,d		;unit/head
+	call	FDC_PUT
+	ret	c
+	ld	a,b		;C = cylinder
+	call	FDC_PUT
+	ret	c
+	ld	a,d
+	rrca
+	rrca
+	and	1		;H = head
+	call	FDC_PUT
+	ret	c
+	ld	a,e		;R = sector
+	call	FDC_PUT
+	ret	c
+	ld	a,2		;N = 2 (512 bytes)
+	call	FDC_PUT
+	ret	c
+	ld	a,e		;EOT = R (single sector per command)
+	call	FDC_PUT
+	ret	c
+	ld	a,0Eh		;GPL
+	call	FDC_PUT
+	ret	c
+	ld	a,0FFh		;DTL
+	jp	FDC_PUT
+
+;------------------------------------------------------------------------------
+; DSKCHG - Disk change detection.
+;   In : A=unit, B=C=media descriptor, HL=DPB base address - 1
+;   Out: Cy=0, B=1 (unchanged) / 0FFh (changed, DPB regenerated at HL+1)
+;        Cy=1, A=error
+;
+; The 7FF1h read is destructive, so pending change bits are accumulated in
+; the SLTWRK byte (+0) and consumed per logical unit.
+;------------------------------------------------------------------------------
+
+DSKCHG:
+	push	af		;logical unit (selects the pending bit below)
+	call	MAP_UNIT
+	call	FDC_SEL
+	call	CHK_READY
+	jr	c,dch_nrdy
+	pop	af
+	push	af
+	push	bc		;media
+	push	hl		;DPB-1
+	call	GET_WORK	;IX -> 8-byte SLTWRK entry
+	ld	a,(FDC_DSKCHG)	;bit4=0 -> physical drive changed
+	cpl
+	and	10h
+	jr	z,dch_acc
+	ld	a,03h		;a physical change hits both logical units
+dch_acc:
+	or	(ix+0)
+	ld	(ix+0),a	;accumulate pending changes
+	pop	hl
+	pop	bc
+	pop	af		;unit
+	inc	a		;mask: unit 0 -> 01h, unit 1 -> 02h
+	and	(ix+0)
+	jr	z,dch_same
+	ld	c,a		;consume this unit's pending bit
+	ld	a,(ix+0)
+	xor	c
+	ld	(ix+0),a
+	call	MAKDPB		;regenerate DPB from media descriptor in B
+	call	MTOFF		;motor off at end of operation
+	ld	b,0FFh		;changed
+	or	a
+	ret
+
+dch_same:
+	call	MTOFF		;motor off at end of operation
+	ld	b,1		;unchanged
+	xor	a
+	ret
+
+dch_nrdy:
+	call	MTOFF		;motor off (preserves AF: Cy=1, A=ERR_NRDY)
+	pop	bc		;balance the unit push
+	ret			;Cy=1, A=ERR_NRDY
+
+;------------------------------------------------------------------------------
+; GETDPB - Build a DPB for the media.
+;   In : A=unit, B=C=media descriptor, HL=DPB base address - 1
+;   Out: DPB (18 bytes) written at HL+1. No error convention.
+;------------------------------------------------------------------------------
+
+GETDPB:
+MAKDPB:	inc	hl
+	ex	de,hl		;DE = destination
+	ld	a,b
+	cp	0F8h
+	jr	nc,mk_idx
+	ld	a,0F9h		;anything unknown: assume 720KB 2DD
+mk_idx:	and	3		;F8->0 F9->1 FA->2 FB->3
+	ld	l,a
+	add	a,a		;*2
+	ld	c,a
+	ld	a,l
+	add	a,a
+	add	a,a
+	add	a,a
+	add	a,a		;*16
+	add	a,c		;*18
+	ld	c,a
+	ld	b,0
+	ld	hl,TBL_DPB
+	add	hl,bc
+	ld	bc,18
+	ldir
+	xor	a
+	ret
+
+CHOICE:	ld	hl,null_message	;No formatting supported
+	ret
+
+DSKFMT:	ld	a,16	;Bad parameter
+	scf
+	ret
+
+MTOFF:	push	af		;Motors off, deselect. Preserves AF: also used
+	xor	a		; as the common "end of operation" epilogue.
+	ld	(FDC_CTRL0),a
+	pop	af
+	ret
+
+;------------------------------------------------------------------------------
+; FDC helpers
+;------------------------------------------------------------------------------
+
+; Map a logical unit onto the single physical drive (standard MSX
+; single-drive behaviour). When the logical unit differs from the one
+; currently in the drive, ask the user to swap disks (PROMPT; games
+; auto-acknowledge via the H.PROMPT hook) and mark both units "changed".
+; In: A=logical unit (0/1). Out: A=0 (physical unit). Preserves BC, DE, HL.
+
+MAP_UNIT:
+	push	bc
+	push	de
+	push	hl
+	push	af
+	call	GET_WORK	;IX -> 8-byte SLTWRK entry
+	pop	af
+	cp	(ix+1)		;(ix+1) = logical unit now in the drive
+	jr	z,mu_done
+	ld	(ix+1),a
+	ld	a,(ix+0)
+	or	03h		;the swap invalidates both logical units
+	ld	(ix+0),a
+	ld	hl,PROMPT
+	ld	(CODE_ADD),hl
+	call	CALLB0		;"Insert disk for drive X: and strike a key"
+mu_done:
+	pop	hl
+	pop	de
+	pop	bc
+	xor	a		;physical unit 0
+	ret
+
+; Select drive + motor on. In: A=unit (0/1). Preserves A.
+; No motor run-on: the emulated FDC needs no spin-up and the motor is
+; switched off at the end of each operation (MTOFF in the epilogues).
+;TODO real HW: motor run-on / spin-up wait management goes here.
+
+FDC_SEL:
+	push	af
+	or	a
+	jr	nz,fs_1
+	ld	a,10h		;motor 0 on, unit 0
+	jr	fs_w
+fs_1:	ld	a,21h		;motor 1 on, unit 1
+fs_w:	ld	(FDC_CTRL0),a
+	pop	af
+	ret
+
+; Media present check via SENSE DEVICE STATUS (ST3 bit5 = ready).
+; In: A=unit. Out: Cy=0 ready / Cy=1 A=ERR_NRDY. Destroys A.
+
+CHK_READY:
+	push	af
+	ld	a,04h		;SENSE DEVICE STATUS
+	call	FDC_PUT
+	jr	c,cr_abort
+	pop	af
+	and	3
+	call	FDC_PUT
+	ret	c
+	call	FDC_GET		;ST3
+	ret	c
+	and	20h		;RDY
+	jr	z,cr_n
+	xor	a
+	ret
+cr_n:	ld	a,ERR_NRDY
+	scf
+	ret
+cr_abort:
+	pop	bc		;keep error in AF
+	ret
+
+; Wait for RQM=1. Out: Cy=1 A=ERR_NRDY on timeout. Destroys A.
+
+W_RQM:	push	bc
+	ld	bc,0		;65536 polls
+wr_1:	ld	a,(FDC_MSR)
+	rlca
+	jr	c,wr_ok
+	dec	bc
+	ld	a,b
+	or	c
+	jr	nz,wr_1
+	pop	bc
+	ld	a,ERR_NRDY
+	scf
+	ret
+wr_ok:	pop	bc
+	or	a		;Cy=0
+	ret
+
+; Write a command/parameter byte to the FDC data register.
+; In: A=value. Out: Cy=1 A=ERR_NRDY on timeout.
+
+FDC_PUT:
+	push	af
+	call	W_RQM
+	jr	c,fp_e
+	pop	af
+	ld	(FDC_DATA),a
+	or	a
+	ret
+fp_e:	pop	bc		;keep error in AF
+	ret
+
+; Read a result byte from the FDC data register.
+; Out: A=byte, Cy=0 / Cy=1 A=ERR_NRDY on timeout.
+
+FDC_GET:
+	call	W_RQM
+	ret	c
+	ld	a,(FDC_DATA)
+	or	a
+	ret
+
+;------------------------------------------------------------------------------
+; LBA2CHS - Convert LBA to track/side/sector using the media descriptor.
+;   In : DE=LBA, C=media descriptor
+;   Out: B=track, C=sector (1-based), A=side. Destroys HL, DE.
+;------------------------------------------------------------------------------
+
+LBA2CHS:
+	ld	a,c
+	and	3
+	push	de		;LBA
+	ld	e,a
+	ld	d,0
+	ld	hl,TBL_F
+	add	hl,de
+	ld	c,(hl)		;C = sectors per cylinder (spt*sides)
+	ld	de,4
+	add	hl,de
+	ld	d,(hl)		;D = sectors per track
+	pop	hl		;HL = LBA
+	call	DIV16_8		;HL = track, A = remainder
+	ld	b,l
+	ld	e,0		;side 0
+	cp	d
+	jr	c,l2c_1
+	sub	d
+	ld	e,1		;side 1
+l2c_1:	inc	a
+	ld	c,a		;sector, 1-based
+	ld	a,e
+	ret
+
+; DIV16_8: HL = HL / C, A = remainder. Destroys B. (C <= 18 here)
+
+DIV16_8:
+	xor	a
+	ld	b,16
+dv_1:	add	hl,hl
+	rla
+	cp	c
+	jr	c,dv_2
+	sub	c
+	inc	l
+dv_2:	djnz	dv_1
+	ret
+
+; Get the 8-byte SLTWRK entry for this slot into IX.
+
+GET_WORK:
+	xor	a
+	ex	af,af'		;A' = 0: slot = current page-1 slot
+	xor	a		;bank 0
+	ld	ix,GWORK
+	call	CALBNK
+	ret
+
+;------------------------------------------------------------------------------
+; Initialization.
+; 1st call: A=0, B=available drive letters, HL=available page-3 space.
+;           Return A=drive count, HL=required page-3 space,
+;           Cy=1 to hook TIMER_INT.
+; 2nd call: A=1, B=allocated drives. Hardware init goes here.
+;------------------------------------------------------------------------------
+
+DV_INIT:
+	or	a
+	jr	nz,INIT2
+	ld	a,2	;Two logical drives (A:/B:) on one physical drive
+	ld	hl,0	;No page-3 work area (SLTWRK is enough)
+	or	a	;Cy=0: no timer interrupt hook (see FDC_SEL note)
+	ret
+INIT2:
+	ld	a,03h		;SPECIFY
+	call	FDC_PUT
+	ld	a,0DFh		;SRT/HUT
+	call	FDC_PUT
+	ld	a,03h		;HLT=1, ND=1 (non-DMA)
+	call	FDC_PUT
+
+	; RECALIBRATE drive 0: a reset clears the FDC track counter but not
+	; the physical head position, so after a warm reset a SEEK to track 0
+	; would be a no-op and READ would fail with "missing address mark".
+	; On cold power-on the head is already at track 0 and this is a no-op.
+	ld	a,10h		;drive 0 select + motor on
+	ld	(FDC_CTRL0),a
+	ld	a,07h		;RECALIBRATE
+	call	FDC_PUT
+	xor	a		;US = drive 0
+	call	FDC_PUT
+	push	bc
+	ld	bc,0		;65536-poll timeout guard
+rc_wait:
+	ld	a,(FDC_MSR)
+	and	0Fh		;drive busy bits
+	jr	z,rc_done
+	dec	bc
+	ld	a,b
+	or	c
+	jr	nz,rc_wait
+rc_done:
+	pop	bc
+	ld	a,08h		;SENSE INTERRUPT STATUS (required after
+	call	FDC_PUT		; RECALIBRATE per datasheet)
+	call	FDC_GET		;ST0 (discard)
+	call	FDC_GET		;PCN (discard)
+	xor	a		;motor off, deselect
+	ld	(FDC_CTRL0),a
+
+	call	GET_WORK
+	ld	(ix+0),3	;both units start as "changed"
+	ld	(ix+1),0	;logical unit 0 is in the drive at boot
+	ret
+
+	; Driver version
+
+DV_VERSION:
+	ld	a,0	;Main
+	ld	b,2	;Secondary
+	ld	c,0	;Revision
+	ret
+
+;------------------------------------------------------------------------------
+; DPB table: 18 bytes per media type (F8/F9/FA/FB), MSX standard geometries.
+; media, secsize, dirmsk, dirshft, clumsk, clushft, firFAT, nFATs,
+; dirents, firdata, maxclus+1, secs/FAT, firdir
+;------------------------------------------------------------------------------
+
+TBL_F:	db	9,18,8,16	;sectors per cylinder (spt*sides), idx=media&3
+TBL_SPT:
+	db	9,9,8,8		;sectors per track
+
+TBL_DPB:
+	;F8: 360KB, 1 side, 9 spt, 80 trk
+	db	0F8h, 00h,02h, 0Fh, 04h, 01h, 02h, 01h,00h, 02h
+	db	70h, 0Ch,00h, 63h,01h, 02h, 05h,00h
+	;F9: 720KB, 2 sides, 9 spt, 80 trk
+	db	0F9h, 00h,02h, 0Fh, 04h, 01h, 02h, 01h,00h, 02h
+	db	70h, 0Eh,00h, 0CAh,02h, 03h, 07h,00h
+	;FA: 320KB, 1 side, 8 spt, 80 trk
+	db	0FAh, 00h,02h, 0Fh, 04h, 01h, 02h, 01h,00h, 02h
+	db	70h, 0Ah,00h, 3Ch,01h, 01h, 03h,00h
+	;FB: 640KB, 2 sides, 8 spt, 80 trk
+	db	0FBh, 00h,02h, 0Fh, 04h, 01h, 02h, 01h,00h, 02h
+	db	70h, 0Ch,00h, 7Bh,02h, 02h, 05h,00h
+
+	end

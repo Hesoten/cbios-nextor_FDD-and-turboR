@@ -1,0 +1,21 @@
+*.o
+*.bin
+*.sym
+*.lst
+*.dep
+*.default
+derived/
+bin/
+dist/
+build/
+tools/
+*.zip
+*.tar.gz
+
+# editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
